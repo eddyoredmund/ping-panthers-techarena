@@ -1,0 +1,9 @@
+data/
+fake_data/
+submissions/
+*.csv
+!results_log.csv
+__pycache__/
+.ipynb_checkpoints/
+*.txt.model
+.venv/
