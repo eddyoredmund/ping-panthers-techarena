@@ -17,6 +17,7 @@ import pandas as pd
 from sklearn.model_selection import GroupKFold
 
 import config as C
+from data import has_time, to_seconds
 
 # How strongly to pull click rates of rarely-seen users/items towards the
 # overall average. Think of it as "pretend we already saw 20 average rows".
@@ -42,27 +43,8 @@ def add_count_features(df, history=None):
     df["event_size"] = df.groupby(C.EVENT_ID)[C.ITEM_ID].transform("size")
     df["item_pop_rank_in_event"] = df.groupby(C.EVENT_ID)["item_n_shown"].rank(pct=True)
 
-    # Time features (only if there is a time column).
-    if C.TIME and C.TIME in df.columns:
-        t = to_seconds(df[C.TIME])
-        df["_t"] = t
-        df = df.sort_values([C.USER_ID, "_t"])
-        # Seconds since this user's previous event (big = coming back after a break).
-        event_time = df.groupby([C.USER_ID, C.EVENT_ID])["_t"].transform("min")
-        df["_event_t"] = event_time
-        firsts = df.drop_duplicates([C.USER_ID, C.EVENT_ID])[[C.USER_ID, C.EVENT_ID, "_event_t"]]
-        firsts = firsts.sort_values([C.USER_ID, "_event_t"])
-        firsts["secs_since_prev_event"] = firsts.groupby(C.USER_ID)["_event_t"].diff()
-        # Which number visit this is for the user (1st, 2nd, ...).
-        firsts["user_event_number"] = firsts.groupby(C.USER_ID).cumcount() + 1
-        df = df.merge(firsts[[C.USER_ID, C.EVENT_ID, "secs_since_prev_event", "user_event_number"]],
-                      on=[C.USER_ID, C.EVENT_ID], how="left")
-        if pd.api.types.is_datetime64_any_dtype(pd.to_datetime(df[C.TIME], errors="coerce")) \
-                and not pd.api.types.is_numeric_dtype(df[C.TIME]):
-            dt = pd.to_datetime(df[C.TIME], errors="coerce")
-            df["hour"] = dt.dt.hour
-            df["day_of_week"] = dt.dt.dayofweek
-        df = df.drop(columns=["_t", "_event_t"])
+    if has_time(df):
+        df = add_time_features(df)
 
     # Optional history file: what the user did before the competition window.
     if history is not None:
@@ -79,11 +61,33 @@ def add_count_features(df, history=None):
     return df
 
 
-def to_seconds(series):
-    """Turn a time column (numbers or date strings) into plain seconds."""
-    if pd.api.types.is_numeric_dtype(series):
-        return series.astype(float)
-    return pd.to_datetime(series, errors="coerce").astype("int64") / 1e9
+def add_time_features(df):
+    """Features about WHEN things happen, for each user."""
+    df["_t"] = to_seconds(df[C.TIME])
+
+    # One row per (user, event), in time order.
+    visits = (df.groupby([C.USER_ID, C.EVENT_ID])["_t"].min().rename("_event_t")
+                .reset_index().sort_values([C.USER_ID, "_event_t"]))
+    by_user = visits.groupby(C.USER_ID)["_event_t"]
+    visits["secs_since_prev_event"] = by_user.diff()       # big = back after a break
+    visits["user_event_number"] = by_user.cumcount() + 1   # 1st visit, 2nd visit, ...
+    if C.USE_FUTURE_FEATURES:
+        visits["secs_until_next_event"] = -by_user.diff(-1)
+        visits["user_events_after"] = by_user.cumcount(ascending=False)
+    df = df.merge(visits.drop(columns="_event_t"), on=[C.USER_ID, C.EVENT_ID], how="left")
+
+    # Has this exact item been shown to this user before (and after)?
+    df = df.sort_values(["user_item", "_t"])
+    df["user_item_shown_before"] = df.groupby("user_item").cumcount()
+    if C.USE_FUTURE_FEATURES:
+        df["user_item_shown_after"] = df.groupby("user_item").cumcount(ascending=False)
+
+    # Hour of day / day of week, only if the time column is a real date.
+    if not pd.api.types.is_numeric_dtype(df[C.TIME]):
+        dt = pd.to_datetime(df[C.TIME], errors="coerce")
+        df["hour"] = dt.dt.hour
+        df["day_of_week"] = dt.dt.dayofweek
+    return df.drop(columns="_t")
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +140,7 @@ def add_click_rates(train_rows, apply_rows, n_folds=5):
 
 # Columns that are NOT features (ids, labels, raw text).
 NOT_FEATURES = {C.ROW_ID, C.EVENT_ID, C.USER_ID, C.ITEM_ID, C.TIME, C.LABEL,
-                "user_item", "is_eval"}
+                "user_item", "is_eval", "train_row"}
 
 
 def feature_columns(df):

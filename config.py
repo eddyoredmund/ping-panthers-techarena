@@ -25,9 +25,21 @@ HIST_USER_ID = "user_id"
 HIST_ITEM_ID = "item_id"
 
 # ---- Validation -----------------------------------------------------------
-# We hold back the LAST 20% of training events (by time) and pretend it's the
-# test set. That score is the one we trust, not the live leaderboard.
+# We hold back 20% of training events and pretend it's the test set. That
+# score is the one we trust, not the live leaderboard.
+# SPLIT = "time"   -> hold back the NEWEST 20% (if evaluation.csv comes after
+#                     train.csv in time)
+# SPLIT = "random" -> hold back a random 20% (if they overlap in time)
+# Run explore.py on the real data: it tells you which one to pick.
+SPLIT = "time"
 VALID_FRACTION = 0.2
+
+# ---- Feature switches -----------------------------------------------------
+# "Future" features look at what the user does AFTER this event (e.g. seconds
+# until their next visit). Allowed in Phase 1, because all of evaluation.csv is
+# given at once, and often a big boost. Impossible in a live system, so turn it
+# OFF when building anything for Phase 2.
+USE_FUTURE_FEATURES = True
 
 # ---- Model ----------------------------------------------------------------
 SEED = 42
