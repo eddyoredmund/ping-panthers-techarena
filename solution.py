@@ -50,7 +50,7 @@ START = 1737331200          # 2025-01-20 00:00 UTC, first training day
 N_TRAIN_DAYS = 7            # training ends at the cutoff, 2025-01-27 00:00 UTC
 CAND = 10                   # candidates per event
 SVD_DIM = 48
-FEATURE_VERSION = "v4"
+FEATURE_VERSION = "v5"
 T0 = time.time()
 
 
@@ -633,12 +633,23 @@ def build_features(D):
         F[f"{name}_minus_max"] = (a - a.max(1, keepdims=True)).astype(np.float32)
         F[f"{name}_minus_mean"] = (a - a.mean(1, keepdims=True)).astype(np.float32)
     F["event_max_item_ctr"] = ev(np.nan_to_num(F["item_ctr"]).max(1))
+    for name in ["svd_hist_mean_cos", "svd_score", "cf_sum", "cf_max", "mf_logit", "mf_dot",
+                 "seq3_last5", "svd_hist_max_cos"]:
+        a = F[name]
+        nan = np.isnan(a)
+        mx = np.where(nan, -np.inf, a).max(1)
+        cnt = (~nan).sum(1)
+        mean = np.where(nan, 0, a).sum(1) / np.maximum(cnt, 1)
+        F[f"ev_max_{name}"] = ev(np.where(cnt > 0, mx, np.nan))
+        F[f"ev_mean_{name}"] = ev(np.where(cnt > 0, mean, np.nan))
+        top2 = np.sort(np.where(nan, -np.inf, a), 1)[:, -2]
+        F[f"ev_gap12_{name}"] = ev(np.where(cnt > 1, mx - top2, np.nan))   # how clear the favourite is
     F["event_max_cand_in_hist"] = ev(F["cand_in_hist"].max(1))
 
     # ---- Slot: the candidate's position inside its event in the file -----------
     # Only used if it matters in train AND looks the same in evaluation (see check_slot).
     F["slot"] = np.tile(np.arange(CAND, dtype=np.float32), (E, 1))
-    slot_ok = check_slot(D, F)
+    slot_ok, slot_maybe = check_slot(D, F)
 
     names = list(F)                                        # "slot" is the last column
     X = np.empty((E * CAND, len(names)), np.float32, order="F")   # column by column: low memory
@@ -653,7 +664,7 @@ def build_features(D):
     first_of_day[key.drop_duplicates(["u", "d"]).index.to_numpy()] = True
     meta = {"y": D["y"].ravel(), "rowid": D["rowid"].ravel(), "day": np.repeat(day, CAND),
             "is_eval": np.repeat(D["is_eval"], CAND), "first": np.repeat(first_of_day, CAND),
-            "names": names, "slot_ok": slot_ok}
+            "names": names, "slot_ok": slot_ok, "slot_maybe": slot_maybe}
     return X, meta
 
 
@@ -663,18 +674,22 @@ def check_slot(D, F):
     y = D["y"][tr] == 1
     rate = y.mean(0)                                         # click rate per slot
     z = np.abs(rate - y.mean()) / np.sqrt(y.mean() * (1 - y.mean()) / y.shape[0])
-    prof_tr = np.nanmean(F["item_ctr"][tr], 0)               # how popular items are per slot
-    prof_ev = np.nanmean(F["item_ctr"][ev], 0)
-    corr = np.corrcoef(prof_tr, prof_ev)[0, 1] if prof_tr.std() > 1e-9 and prof_ev.std() > 1e-9 else 0
-    spread = prof_tr.std() / prof_tr.mean()
     log(f"Slot check: click rate by slot {np.round(rate, 4).tolist()} (max z={z.max():.1f})")
-    log(f"  item popularity by slot: train spread {spread:.3f}, train/eval correlation {corr:.2f}")
-    ok = bool(z.max() > 8 and spread > 0.01 and corr > 0.9)
-    if z.max() > 8 and not ok:
-        log("  !! Slot matters in train but can't be confirmed for evaluation. Try --use-slot as a "
-            "separate submission and compare public scores.")
+    confirmed = False
+    for name in ["svd_hist_mean_cos", "cand_in_hist", "cf_sum", "item_ctr", "item_users_before"]:
+        prof_tr = np.nanmean(F[name][tr], 0)                  # label-free profile by slot
+        prof_ev = np.nanmean(F[name][ev], 0)
+        corr = np.corrcoef(prof_tr, prof_ev)[0, 1] if prof_tr.std() > 1e-12 and prof_ev.std() > 1e-12 else 0
+        spread = prof_tr.std() / (abs(prof_tr.mean()) + 1e-9)
+        log(f"  {name:<18} by slot: train spread {spread:.3f}, train/eval correlation {corr:.2f}")
+        confirmed |= bool(spread > 0.02 and corr > 0.9)
+    ok = bool(z.max() > 8 and confirmed)
+    maybe = bool(z.max() > 8 and not confirmed)
+    if maybe:
+        log("  !! Slot matters in train but can't be confirmed for evaluation: an extra submission "
+            "WITH slot will be made too - compare the two public scores.")
     log(f"  slot feature {'ON' if ok else 'OFF'}")
-    return ok
+    return ok, maybe
 
 
 # =============================================================================
@@ -721,6 +736,13 @@ def validate(X, meta, cols, args):
     for name in ["mf_prob", "svd_hist_mean_cos", "svd_score", "cf_sum", "cf_max", "seq3_last5",
                  "trans_last3", "cand_in_hist", "user_ctr", "item_ctr"]:
         log(f"  single feature {name:<18} AUC {roc_auc_score(y[val] == 1, np.nan_to_num(X[val, meta['names'].index(name)], nan=-9)):.5f}")
+    nm = meta["names"]
+    if all(n in nm for n in ["item_ctr", "user_ctr", "cf_sum"]):
+        lg = lambda p: np.log(np.clip(p, 1e-6, 1 - 1e-6) / (1 - np.clip(p, 1e-6, 1 - 1e-6)))
+        g = (y[~meta["is_eval"]] == 1).mean()
+        st = (lg(X[val, nm.index("item_ctr")]) + lg(X[val, nm.index("user_ctr")]) - lg(g)
+              + 25 * np.nan_to_num(X[val, nm.index("cf_sum")]))
+        log(f"  STARTER-STYLE score (item + user click rates + 25 x co-click) AUC {roc_auc_score(y[val] == 1, st):.5f}")
     dtrain = lgb.Dataset(take(X, fit, cols), y[fit], feature_name=names, free_raw_data=True)
     Xv = take(X, val_all, cols)
     dval = lgb.Dataset(Xv[first], y[val], reference=dtrain)
@@ -790,7 +812,7 @@ def ablate(X, meta, cols, args):
         log(f"  train on days {md}-5 only{'':<17} {a:.5f}  ({a - base:+.5f})")
 
 
-def final_submission(X, meta, cols, args, n_trees, beta, val_model):
+def final_submission(X, meta, cols, args, n_trees, beta, val_model, tag=""):
     y = meta["y"]
     names = [meta["names"][c] for c in cols]
     ev = np.nonzero(meta["is_eval"])[0]               # whole events, in order
@@ -811,7 +833,7 @@ def final_submission(X, meta, cols, args, n_trees, beta, val_model):
     sub = pd.DataFrame({"rowid": meta["rowid"][ev], "predicted_probability": np.clip(preds, 0, 1)})
     check_submission(sub, args.data_dir)
     os.makedirs("submissions", exist_ok=True)
-    path = f"submissions/sub_{datetime.now():%m%d_%H%M%S}.csv"
+    path = f"submissions/sub_{datetime.now():%m%d_%H%M%S}{tag}.csv"
     sub.to_csv(path, index=False, float_format="%.7g")
     log(f"Saved {path}  <- upload this one")
     return path
@@ -901,6 +923,11 @@ def main():
     path = None
     if not args.valid_only:
         path = final_submission(X, meta, cols, args, n_trees or 800, beta or 0.0, val_model)
+        if meta.get("slot_maybe") and not use_slot:
+            log("Extra submission WITH the slot feature (upload both, keep the better public score):")
+            slot_cols = cols + [len(meta["names"]) - 1]
+            args.no_refit = False
+            final_submission(X, meta, slot_cols, args, n_trees or 800, beta or 0.0, None, "_with_slot")
     log_result(auc, n_trees, args, path, beta)
     log("Done. Copy everything above and paste it to the team / Claude.")
 
