@@ -327,18 +327,23 @@ class ChoiceMF:
         return -np.log(np.maximum(picked, 1e-9)).mean()
 
 
+MF_SETTINGS = {"k": 32, "lr": 0.05, "reg": 1e-4, "new_passes": 1}
+
+
 def choice_model_features(D, F, day, batch=4096):
     """Train the choice model day by day; day d's features come from days < d only."""
     log("Choice model (learned taste vectors, trained day by day)...")
     E = len(D["ts"])
     names = ["mf_logit", "mf_prob", "mf_dot", "mf_item_bias", "mf_user_bias", "mf_p_any"]
     out = {n: np.full((E, CAND), np.nan, np.float32) for n in names}
-    mf = ChoiceMF(D, F)
+    cfg = MF_SETTINGS
+    mf = ChoiceMF(D, F, k=cfg["k"], lr=cfg["lr"], reg=cfg["reg"])
     rng = np.random.default_rng(0)
     train_ev = np.nonzero(~D["is_eval"])[0]
     for d in range(1, N_TRAIN_DAYS + 1):
         losses = []
-        for part in (train_ev[day[train_ev] < d], train_ev[day[train_ev] == d - 1]):
+        parts = [train_ev[day[train_ev] < d]] + [train_ev[day[train_ev] == d - 1]] * cfg["new_passes"]
+        for part in parts:
             perm = rng.permutation(part)
             for s in range(0, len(perm), batch):
                 losses.append(mf.step(perm[s:s + batch]))
