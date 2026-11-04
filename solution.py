@@ -721,10 +721,20 @@ def main():
     ap.add_argument("--beta", type=float, default=None, help="event re-balancing (default: from validation)")
     ap.add_argument("--no-refit", action="store_true", help="submit with the validation model (saves time)")
     ap.add_argument("--use-slot", action="store_true")
+    ap.add_argument("--refit-last", action="store_true",
+                    help="skip validation: retrain on ALL days with the trees/beta/lr found by the last validated run")
     ap.add_argument("--note", default="")
     args = ap.parse_args()
     if args.fast:
         args.lr, args.neg_frac, args.no_refit = 0.1, 0.3, True
+    if args.refit_last:
+        runs = pd.read_csv("results_log.csv")
+        last = runs[runs["local_auc"].notna()].iloc[-1]
+        args.skip_valid, args.no_refit = True, False
+        args.trees, args.lr = int(last["trees"]), float(last["lr"])
+        args.beta = 0.0 if pd.isna(last["beta"]) else float(last["beta"])
+        log(f"Refit with the last validated run's settings: {args.trees} trees, lr {args.lr}, "
+            f"beta {args.beta} (its local AUC was {last['local_auc']})")
     PARAMS["learning_rate"] = args.lr
 
     tag = os.path.basename(os.path.abspath(args.data_dir))
