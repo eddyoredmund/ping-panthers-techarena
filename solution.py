@@ -182,6 +182,17 @@ def svd_for_day(clicks, cutoff, n_users, n_items):
     return pad(user_vec), pad(item_vec), pad(item_norm), item_users, user_clicks
 
 
+def transitions_for_day(clicks, cutoff, n_items):
+    """'People who clicked A clicked B NEXT': counts of consecutive click pairs before cutoff."""
+    c = clicks[clicks["t"] < cutoff].sort_values(["u", "t"], kind="stable")
+    u, i = c["u"].values, c["i"].values.astype(np.int64)
+    same = u[1:] == u[:-1]
+    a, b = i[:-1][same], i[1:][same]
+    pairs = pd.Series(a * n_items + b).value_counts()
+    out_deg = np.bincount(a, minlength=n_items + 1).astype(np.float32)
+    return pd.Index(pairs.index), pairs.values.astype(np.float32), out_deg
+
+
 def build_features(D):
     E, L = len(D["ts"]), D["L"]
     ts, user, C, H, Ht, h_len = D["ts"], D["user"], D["C"], D["H"], D["Ht"], D["h_len"]
@@ -244,11 +255,32 @@ def build_features(D):
     first_seen = pd.Series(r_ts).groupby(r_item).transform("min").values
     F["item_age_days"] = ((r_ts - first_seen) / DAY).reshape(E, CAND).astype(np.float32)
 
+    # Click rates by time of day / weekend (the organisers gave us these columns
+    # for a reason). Shrunk towards the item's / user's overall rate.
+    r_tb = np.repeat(D["time_bucket"], CAND).astype(np.int64)
+    r_dt = np.repeat(D["day_type"], CAND).astype(np.int64)
+    for name, key, base, k in [("item_tb", r_item * 4 + r_tb, "item_ctr", 30),
+                               ("item_dt", r_item * 2 + r_dt, "item_ctr", 30),
+                               ("user_tb", r_user * 4 + r_tb, "user_ctr", 20),
+                               ("user_dt", r_user * 2 + r_dt, "user_ctr", 20)]:
+        n, c = asof_counts(key, r_ts, lab, clk)
+        F[f"{name}_ctr"] = ((c.reshape(E, CAND) + k * F[base]) / (n.reshape(E, CAND) + k)).astype(np.float32)
+        F[f"{name}_lift"] = (F[f"{name}_ctr"] / F[base]).astype(np.float32)
+
+    # When was this item last SHOWN to this user (clicked or not)?
+    key = r_user * D["n_items"] + r_item
+    o = np.lexsort((r_ts, key))
+    prev = np.full(len(key), np.nan)
+    prev[o[1:]] = np.where(key[o][1:] == key[o][:-1], r_ts[o][:-1], np.nan)
+    F["ui_secs_since_shown"] = (r_ts - prev).reshape(E, CAND).astype(np.float32)
+    del key, o, prev
+
     # ---- Candidate vs. this user's own history (repeat clicks) ---------------
     log("Features: candidate vs. history...")
     for name in ["cand_in_hist", "cand_secs_since_clicked", "cand_pos_from_end", "cand_is_last",
                  "svd_score", "svd_hist_mean_cos", "svd_hist_max_cos", "svd_last_cos",
-                 "svd_recent5_cos", "item_users_before", "user_clicks_before"]:
+                 "svd_recent5_cos", "item_users_before", "user_clicks_before",
+                 "trans_last1", "trans_last3", "trans_count_last1"]:
         F[name] = np.full((E, CAND), np.nan, np.float32)
     B = 20000
     for s in range(0, E, B):
@@ -272,9 +304,23 @@ def build_features(D):
             continue
         uvec, ivec, inorm, item_users, user_clicks = svd_for_day(
             clicks, START + d * DAY, D["n_users"], D["n_items"])
+        pair_index, pair_count, out_deg = transitions_for_day(clicks, START + d * DAY, D["n_items"])
         for s in range(0, len(idx), B):
             e = idx[s:s + B]
             Cb, Hb, hl = C[e], H[e], h_len[e]
+
+            # Transitions from the user's last 3 clicks to the candidate.
+            t3 = np.zeros(Cb.shape, np.float32)
+            for back, w in [(0, 1.0), (1, 0.5), (2, 0.25)]:
+                h = np.where(hl > back, Hb[np.arange(len(e)), np.maximum(hl - 1 - back, 0)], -1)
+                pos = pair_index.get_indexer((h[:, None].astype(np.int64) * D["n_items"] + Cb).ravel())
+                cnt = np.where((pos >= 0) & (np.repeat(h, CAND) >= 0), pair_count[pos], 0).reshape(Cb.shape)
+                rate = cnt / (out_deg[h][:, None] + 10)
+                t3 += w * rate
+                if back == 0:
+                    F["trans_last1"][e] = np.where(hl[:, None] > 0, rate, np.nan)
+                    F["trans_count_last1"][e] = np.where(hl[:, None] > 0, cnt, np.nan)
+            F["trans_last3"][e] = np.where(hl[:, None] > 0, t3, np.nan)
             cv = inorm[Cb]                                     # [b, 10, k]
             hv = inorm[Hb]                                     # [b, L, k]  (pad -> zero row)
             sims = np.einsum("bck,blk->bcl", cv, hv)           # cosine to each history item
@@ -298,7 +344,8 @@ def build_features(D):
     # ---- Competition inside the event ---------------------------------------
     log("Features: comparison with the other candidates...")
     for name in ["item_ctr", "item_prevday_ctr", "ui_ctr", "svd_score", "svd_hist_mean_cos",
-                 "svd_hist_max_cos", "cand_in_hist", "item_users_before"]:
+                 "svd_hist_max_cos", "cand_in_hist", "item_users_before", "item_tb_ctr",
+                 "item_dt_ctr", "trans_last1", "trans_last3"]:
         a = np.nan_to_num(F[name], nan=-1)
         F[f"{name}_rank"] = (a.argsort(1).argsort(1) / (CAND - 1)).astype(np.float32)
         F[f"{name}_minus_max"] = (a - a.max(1, keepdims=True)).astype(np.float32)
@@ -357,20 +404,42 @@ def validate(X, meta, args):
     log(f"    LOCAL AUC (all day-6 events): {auc_all:.5f}   trees: {model.best_iteration}")
     imp = pd.Series(model.feature_importance("gain"), index=meta["names"])
     print("\nTop 25 features:\n" + (imp / imp.sum()).sort_values(ascending=False).head(25).round(4).to_string())
-    return auc, model.best_iteration
+
+    # At most one click per event, so an event's probabilities should add up to <= 1.
+    # Try pulling each event's predictions down by beta * log(sum of the event).
+    p_first = p_all[meta["first"][val_all]]
+    print("\nEvent re-balancing (beta=0 means off):")
+    best_beta, best_auc = 0.0, auc
+    for beta in [0.25, 0.5, 0.75, 1.0]:
+        a = roc_auc_score(y[val], rebalance(p_first, beta))
+        print(f"  beta {beta:.2f}: AUC {a:.5f}")
+        if a > best_auc + 1e-5:
+            best_beta, best_auc = beta, a
+    log(f">>> BEST LOCAL AUC: {best_auc:.5f} with beta={best_beta}")
+    return best_auc, model.best_iteration, best_beta
 
 
-def final_submission(X, meta, args, n_trees, data_dir):
+def rebalance(p, beta):
+    """p: predictions for whole events in order (10 per event)."""
+    if beta == 0:
+        return p
+    p = np.clip(p.reshape(-1, CAND), 1e-7, 1 - 1e-7)
+    score = np.log(p) - beta * np.log(p.sum(1, keepdims=True))
+    return (1 / (1 + np.exp(-(score - np.log1p(-p))))).ravel()   # back into (0, 1)
+
+
+def final_submission(X, meta, args, n_trees, data_dir, beta):
     y = meta["y"]
     fit = pick_rows(~meta["is_eval"], y, args.neg_frac, 1)
-    ev = np.nonzero(meta["is_eval"])[0]
-    log(f"Final model: {len(fit):,} rows, {n_trees} trees x {args.seeds} seed(s)")
+    ev = np.nonzero(meta["is_eval"])[0]               # whole events, in order
+    log(f"Final model: {len(fit):,} rows, {n_trees} trees x {args.seeds} seed(s), beta={beta}")
     preds = np.zeros(len(ev))
     for seed in range(args.seeds):
         dtrain = lgb.Dataset(X[fit], y[fit], feature_name=meta["names"])
         model = lgb.train({**PARAMS, "seed": seed}, dtrain, num_boost_round=n_trees)
-        preds += pd.Series(model.predict(X[ev])).rank(pct=True).values / args.seeds  # AUC = ranks
+        preds += model.predict(X[ev]) / args.seeds
         log(f"  seed {seed} done")
+    preds = rebalance(preds, beta)
     sub = pd.DataFrame({"rowid": meta["rowid"][ev], "predicted_probability": np.clip(preds, 0, 1)})
     check_submission(sub, data_dir)
     os.makedirs("submissions", exist_ok=True)
@@ -410,11 +479,12 @@ def main():
     ap.add_argument("--max-trees", type=int, default=3000)
     ap.add_argument("--seeds", type=int, default=1)
     ap.add_argument("--lr", type=float, default=0.05, help="learning rate (0.1 = faster, a bit worse)")
+    ap.add_argument("--beta", type=float, default=None, help="event re-balancing (default: chosen on validation)")
     ap.add_argument("--note", default="")
     args = ap.parse_args()
     PARAMS["learning_rate"] = args.lr
 
-    cache = os.path.join("cache", os.path.basename(os.path.abspath(args.data_dir)))
+    cache = os.path.join("cache", os.path.basename(os.path.abspath(args.data_dir)) + "_v2")
     if os.path.exists(cache + "_X.npy") and not args.rebuild:
         log("Loading cached features")
         X = np.load(cache + "_X.npy")
@@ -425,13 +495,14 @@ def main():
         np.save(cache + "_X.npy", X)
         pickle.dump(meta, open(cache + "_meta.pkl", "wb"))
 
-    auc, n_trees = None, args.trees
+    auc, n_trees, beta = None, args.trees, args.beta
     if not args.skip_valid:
-        auc, best = validate(X, meta, args)
+        auc, best, found_beta = validate(X, meta, args)
         n_trees = n_trees or int(best * 1.15)
+        beta = found_beta if beta is None else beta
     path = None
     if not args.valid_only:
-        path = final_submission(X, meta, args, n_trees or 800, args.data_dir)
+        path = final_submission(X, meta, args, n_trees or 800, args.data_dir, beta or 0.0)
     log_result(auc, n_trees, args, path)
     log("Done. Copy everything above and paste it to the team / Claude.")
 
