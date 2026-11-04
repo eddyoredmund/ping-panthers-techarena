@@ -50,7 +50,7 @@ START = 1737331200          # 2025-01-20 00:00 UTC, first training day
 N_TRAIN_DAYS = 7            # training ends at the cutoff, 2025-01-27 00:00 UTC
 CAND = 10                   # candidates per event
 SVD_DIM = 12                # the taste space is small: 12 beat 48 by a lot on the real data
-FEATURE_VERSION = "v6"
+FEATURE_VERSION = "v7"
 T0 = time.time()
 
 
@@ -232,6 +232,30 @@ def svd_for_day(clicks, cutoff, n_users, n_items):
     item_norm = item_vec / np.maximum(np.linalg.norm(item_vec, axis=1, keepdims=True), 1e-9)
     pad = lambda a: np.vstack([a, np.zeros((1, a.shape[1]), np.float32)])   # index -1 -> zeros
     return pad(user_vec), pad(item_vec), pad(item_norm), item_users, user_clicks
+
+
+def svd_neg_for_day(clicks, Nm, cutoff, n_users, n_items, alpha=0.1):
+    """Taste from clicks MINUS a little for every item the user was shown but skipped."""
+    c = clicks[clicks["t"] < cutoff]
+    P = sparse.csr_matrix((np.ones(len(c), np.float32), (c["u"].to_numpy(), c["i"].to_numpy())),
+                          shape=(n_users, n_items))
+    P.sum_duplicates()
+    P.data = np.log1p(P.data)
+    N = Nm.copy()
+    N.data = np.log1p(N.data)
+    X = (P - alpha * N).tocsr()
+    n_u = np.asarray((X != 0).sum(1)).ravel()
+    n_i = np.asarray((X != 0).sum(0)).ravel()
+    X = (sparse.diags((n_u + 20.0) ** -0.5) @ X @ sparse.diags((n_i + 20.0) ** -0.5)).astype(np.float64)
+    try:
+        U, S, VT = svds(X, k=SVD_DIM, random_state=0)
+    except TypeError:
+        U, S, VT = svds(X, k=SVD_DIM)
+    user_vec = (U * S).astype(np.float32)
+    item_vec = VT.T.astype(np.float32)
+    item_norm = item_vec / np.maximum(np.linalg.norm(item_vec, axis=1, keepdims=True), 1e-9)
+    pad = lambda a: np.vstack([a, np.zeros((1, a.shape[1]), np.float32)])
+    return pad(user_vec), pad(item_vec), pad(item_norm)
 
 
 def transitions_for_day(clicks, cutoff, n_items):
@@ -522,8 +546,15 @@ def build_features(D):
                  "svd_recent5_cos", "svd_same_bucket_cos", "item_users_before", "user_clicks_before",
                  "trans_last1", "trans_last3", "trans_count_last1",
                  "cf_sum", "cf_max", "cf_mean", "cf_recent5", "cf_last", "cf_linked_share",
-                 "cf_raw_sum", "seq3_last1", "seq3_last5"]:
+                 "cf_raw_sum", "seq3_last1", "seq3_last5",
+                 "svdn_score", "svdn_hist_mean_cos", "svdn_hist_max_cos", "svdn_recent5_cos",
+                 "skip_cos", "user_skips_before"]:
         F[name] = np.full((E, CAND), np.nan, np.float32)
+
+    # Shown-but-not-clicked rows (training labels = 0), used only for LATER days.
+    ne, nj = np.nonzero((D["y"] == 0) & ~D["is_eval"][:, None])
+    neg_u, neg_i, neg_t = D["user"][ne], D["C"][ne, nj], D["ts"][ne]
+    del ne, nj
     B = 20000
     for s in range(0, E, B):
         sl = slice(s, s + B)
@@ -549,6 +580,14 @@ def build_features(D):
         uvec, ivec, inorm, item_users, user_clicks = svd_for_day(
             clicks, START + d * DAY, D["n_users"], D["n_items"])
         pair_index, pair_count, out_deg = transitions_for_day(clicks, START + d * DAY, D["n_items"])
+        before = neg_t < START + d * DAY
+        Nm = sparse.csr_matrix((np.ones(int(before.sum()), np.float32), (neg_u[before], neg_i[before])),
+                               shape=(D["n_users"], D["n_items"]))
+        Nm.sum_duplicates()
+        nuvec, nivec, ninorm = svd_neg_for_day(clicks, Nm, START + d * DAY, D["n_users"], D["n_items"])
+        skip_vec = np.asarray(Nm @ inorm[:-1], dtype=np.float32)          # what the user skipped, as taste
+        skip_vec /= np.maximum(np.linalg.norm(skip_vec, axis=1, keepdims=True), 1e-9)
+        user_skips = np.asarray(Nm.sum(1)).ravel().astype(np.float32)
         co_keys, co_vals, n_i = cooc_for_day(clicks, START + d * DAY, D["n_users"], D["n_items"])
         s3_keys, s3_vals, s3_out = seq_window_for_day(clicks, START + d * DAY, D["n_items"])
         nI = D["n_items"]
@@ -610,10 +649,23 @@ def build_features(D):
             hmean /= np.maximum(np.linalg.norm(hmean, axis=1, keepdims=True), 1e-9)
             F["svd_hist_mean_cos"][e] = np.where(has, np.einsum("bck,bk->bc", cv, hmean), np.nan)
             F["svd_score"][e] = np.einsum("bck,bk->bc", ivec[Cb], uvec[user[e]])
+
+            # Same ideas in the taste space that also learned from skipped items.
+            ncv, nhv = ninorm[Cb], ninorm[Hb]
+            nsims = np.einsum("bck,blk->bcl", ncv, nhv)
+            F["svdn_hist_max_cos"][e] = np.where(has, np.where(hmask, nsims, -2).max(2), np.nan)
+            F["svdn_recent5_cos"][e] = np.where(has, (nsims * recent).sum(2) / np.maximum(recent.sum(2), 1), np.nan)
+            nhm = nhv.sum(1)
+            nhm /= np.maximum(np.linalg.norm(nhm, axis=1, keepdims=True), 1e-9)
+            F["svdn_hist_mean_cos"][e] = np.where(has, np.einsum("bck,bk->bc", ncv, nhm), np.nan)
+            F["svdn_score"][e] = np.einsum("bck,bk->bc", nivec[Cb], nuvec[user[e]])
+            # Does the candidate look like things this user was shown and skipped?
+            F["skip_cos"][e] = np.einsum("bck,bk->bc", cv, skip_vec[user[e]])
+            F["user_skips_before"][e] = user_skips[user[e]][:, None]
             F["item_users_before"][e] = item_users[Cb]
             F["user_clicks_before"][e] = user_clicks[user[e]][:, None]
         log(f"  day {d}: {len(idx):,} events (co-click pairs {len(co_keys):,})")
-        del co_keys, co_vals, s3_keys, s3_vals
+        del co_keys, co_vals, s3_keys, s3_vals, Nm
     del clicks
 
     # Running totals grow during the week, and evaluation sits at the very end, beyond
@@ -632,14 +684,15 @@ def build_features(D):
                  "svd_hist_max_cos", "cand_in_hist", "item_users_before", "item_tb_ctr",
                  "item_dt_ctr", "trans_last1", "trans_last3", "mf_logit", "mf_dot",
                  "item_day_share", "svd_same_bucket_cos", "cf_sum", "cf_max", "cf_recent5",
-                 "seq3_last5", "item_users_before_per_day"]:
+                 "seq3_last5", "item_users_before_per_day", "svdn_score", "svdn_hist_mean_cos",
+                 "svdn_hist_max_cos", "skip_cos"]:
         a = np.nan_to_num(F[name], nan=-1)
         F[f"{name}_rank"] = (a.argsort(1).argsort(1) / (CAND - 1)).astype(np.float32)
         F[f"{name}_minus_max"] = (a - a.max(1, keepdims=True)).astype(np.float32)
         F[f"{name}_minus_mean"] = (a - a.mean(1, keepdims=True)).astype(np.float32)
     F["event_max_item_ctr"] = ev(np.nan_to_num(F["item_ctr"]).max(1))
     for name in ["svd_hist_mean_cos", "svd_score", "cf_sum", "cf_max", "mf_logit", "mf_dot",
-                 "seq3_last5", "svd_hist_max_cos"]:
+                 "seq3_last5", "svd_hist_max_cos", "svdn_hist_mean_cos", "svdn_score"]:
         a = F[name]
         nan = np.isnan(a)
         mx = np.where(nan, -np.inf, a).max(1)
@@ -739,7 +792,8 @@ def validate(X, meta, cols, args):
     val = val_all[first]
     log(f"Validation: fit {len(fit):,} rows (days {args.min_day}-5), test {len(val):,} rows "
         f"(first event per user, day 6)")
-    for name in ["mf_prob", "svd_hist_mean_cos", "svd_score", "cf_sum", "cf_max", "seq3_last5",
+    for name in ["mf_prob", "svd_hist_mean_cos", "svd_score", "svdn_hist_mean_cos", "svdn_score",
+                 "skip_cos", "cf_sum", "cf_max", "seq3_last5",
                  "trans_last3", "cand_in_hist", "user_ctr", "item_ctr"]:
         log(f"  single feature {name:<18} AUC {roc_auc_score(y[val] == 1, np.nan_to_num(X[val, meta['names'].index(name)], nan=-9)):.5f}")
     nm = meta["names"]
