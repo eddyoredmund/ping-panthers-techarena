@@ -8,3 +8,6 @@ __pycache__/
 *.txt.model
 .venv/
 preds/
+cache/
+fake_phase1/
+starter_solution.py
