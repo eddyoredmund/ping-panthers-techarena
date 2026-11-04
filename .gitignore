@@ -10,4 +10,3 @@ __pycache__/
 preds/
 cache/
 fake_phase1/
-starter_solution.py
