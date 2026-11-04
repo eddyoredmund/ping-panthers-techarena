@@ -50,7 +50,7 @@ START = 1737331200          # 2025-01-20 00:00 UTC, first training day
 N_TRAIN_DAYS = 7            # training ends at the cutoff, 2025-01-27 00:00 UTC
 CAND = 10                   # candidates per event
 SVD_DIM = 48
-FEATURE_VERSION = "v3"
+FEATURE_VERSION = "v4"
 T0 = time.time()
 
 
@@ -238,6 +238,51 @@ def transitions_for_day(clicks, cutoff, n_items):
     pairs = pd.Series(a * n_items + b).value_counts()
     out_deg = np.bincount(a, minlength=n_items + 1).astype(np.float32)
     return pd.Index(pairs.index), pairs.to_numpy(np.float32), out_deg
+
+
+def cooc_for_day(clicks, cutoff, n_users, n_items):
+    """Exact 'people who clicked X also clicked Y': co[x, y] = number of users who clicked
+    both before cutoff (full detail, unlike the 48-number SVD fingerprints)."""
+    c = clicks[clicks["t"] < cutoff]
+    per_user = c.groupby("u")["i"].nunique()
+    if (per_user.astype(np.float64) ** 2).sum() > 1.2e8:     # protect memory: cap very active users
+        c = c.sort_values("t").groupby("u").tail(40)
+    c = c[["u", "i"]].drop_duplicates()
+    X = sparse.csr_matrix((np.ones(len(c), np.float32), (c["u"].to_numpy(), c["i"].to_numpy())),
+                          shape=(n_users, n_items))
+    co = (X.T @ X).tocsr()
+    del X
+    co.sort_indices()
+    n_i = np.asarray(co.diagonal(), dtype=np.float32)
+    keys = np.repeat(np.arange(n_items, dtype=np.int64) * n_items, np.diff(co.indptr))
+    keys += co.indices                                            # sorted, for fast lookup
+    vals = co.data.astype(np.float32)
+    del co
+    return keys, vals, n_i
+
+
+def seq_window_for_day(clicks, cutoff, n_items, window=3):
+    """'After clicking X, people click Y within their next 3 clicks' (closer = more weight)."""
+    c = clicks[clicks["t"] < cutoff].sort_values(["u", "t"], kind="stable")
+    u, i = c["u"].to_numpy(), c["i"].to_numpy().astype(np.int64)
+    keys, wts = [], []
+    for off in range(1, window + 1):
+        same = u[off:] == u[:-off]
+        keys.append(i[:-off][same] * n_items + i[off:][same])
+        wts.append(np.full(int(same.sum()), 1.0 / off, np.float32))
+    keys, wts = np.concatenate(keys), np.concatenate(wts)
+    uniq, inv = np.unique(keys, return_inverse=True)
+    counts = np.bincount(inv.ravel(), weights=wts).astype(np.float32)
+    out_deg = np.bincount(uniq // n_items, weights=counts, minlength=n_items + 1).astype(np.float32)
+    return uniq, counts, out_deg
+
+
+def lookup(keys, vals, q):
+    """vals for each query key in q (0 if missing). keys must be sorted."""
+    if len(keys) == 0:
+        return np.zeros(q.shape, np.float32)
+    pos = np.minimum(np.searchsorted(keys, q), len(keys) - 1)
+    return np.where(keys[pos] == q, vals[pos], 0).astype(np.float32)
 
 
 # =============================================================================
@@ -470,7 +515,9 @@ def build_features(D):
                  "cand_in_hist_same_bucket",
                  "svd_score", "svd_hist_mean_cos", "svd_hist_max_cos", "svd_last_cos",
                  "svd_recent5_cos", "svd_same_bucket_cos", "item_users_before", "user_clicks_before",
-                 "trans_last1", "trans_last3", "trans_count_last1"]:
+                 "trans_last1", "trans_last3", "trans_count_last1",
+                 "cf_sum", "cf_max", "cf_mean", "cf_recent5", "cf_last", "cf_linked_share",
+                 "cf_raw_sum", "seq3_last1", "seq3_last5"]:
         F[name] = np.full((E, CAND), np.nan, np.float32)
     B = 20000
     for s in range(0, E, B):
@@ -497,10 +544,40 @@ def build_features(D):
         uvec, ivec, inorm, item_users, user_clicks = svd_for_day(
             clicks, START + d * DAY, D["n_users"], D["n_items"])
         pair_index, pair_count, out_deg = transitions_for_day(clicks, START + d * DAY, D["n_items"])
+        co_keys, co_vals, n_i = cooc_for_day(clicks, START + d * DAY, D["n_users"], D["n_items"])
+        s3_keys, s3_vals, s3_out = seq_window_for_day(clicks, START + d * DAY, D["n_items"])
+        nI = D["n_items"]
         for s in range(0, len(idx), B):
             e = idx[s:s + B]
             Cb, Hb, hl = C[e], H[e], h_len[e]
             has = hl[:, None] > 0
+
+            # Exact co-clicks between the candidate and every history item.
+            hb = np.maximum(Hb, 0).astype(np.int64)
+            pair_ok = (Hb >= 0)[:, None, :] & (Hb[:, None, :] != Cb[:, :, None])
+            q = Cb[:, :, None].astype(np.int64) * nI + hb[:, None, :]
+            co = np.where(pair_ok, lookup(co_keys, co_vals, q.ravel()).reshape(q.shape), 0)
+            cf = co / (np.sqrt(np.maximum(n_i[Cb], 1))[:, :, None] * np.sqrt(np.maximum(n_i[hb], 1))[:, None, :])
+            nv = pair_ok.sum(2)
+            F["cf_sum"][e] = cf.sum(2)
+            F["cf_max"][e] = cf.max(2)
+            F["cf_mean"][e] = np.where(nv > 0, cf.sum(2) / np.maximum(nv, 1), np.nan)
+            last5 = pair_ok & (np.arange(L)[None, None, :] >= (hl - 5)[:, None, None])
+            F["cf_recent5"][e] = (cf * last5).sum(2)
+            F["cf_last"][e] = np.where(has, cf[np.arange(len(e)), :, np.maximum(hl - 1, 0)], np.nan)
+            F["cf_linked_share"][e] = np.where(nv > 0, (co > 0).sum(2) / np.maximum(nv, 1), np.nan)
+            F["cf_raw_sum"][e] = co.sum(2)
+
+            # "Within the next 3 clicks" links from the last 5 history items.
+            s5 = np.zeros(Cb.shape, np.float32)
+            for back, w in [(0, 1.0), (1, 0.7), (2, 0.5), (3, 0.35), (4, 0.25)]:
+                h = np.where(hl > back, Hb[np.arange(len(e)), np.maximum(hl - 1 - back, 0)], -1)
+                cnt = lookup(s3_keys, s3_vals, (np.maximum(h, 0)[:, None].astype(np.int64) * nI + Cb).ravel()).reshape(Cb.shape)
+                rate = np.where((h >= 0)[:, None], cnt / (s3_out[np.maximum(h, 0)][:, None] + 10), 0)
+                s5 += w * rate
+                if back == 0:
+                    F["seq3_last1"][e] = np.where(has, rate, np.nan)
+            F["seq3_last5"][e] = np.where(has, s5, np.nan)
 
             t3 = np.zeros(Cb.shape, np.float32)
             for back, w in [(0, 1.0), (1, 0.5), (2, 0.25)]:
@@ -530,8 +607,16 @@ def build_features(D):
             F["svd_score"][e] = np.einsum("bck,bk->bc", ivec[Cb], uvec[user[e]])
             F["item_users_before"][e] = item_users[Cb]
             F["user_clicks_before"][e] = user_clicks[user[e]][:, None]
-        log(f"  day {d}: {len(idx):,} events")
+        log(f"  day {d}: {len(idx):,} events (co-click pairs {len(co_keys):,})")
+        del co_keys, co_vals, s3_keys, s3_vals
     del clicks
+
+    # Running totals grow during the week, and evaluation sits at the very end, beyond
+    # anything the model trained on. Per-day rates don't have that problem.
+    elapsed = ev(np.maximum((np.minimum(ts, START + N_TRAIN_DAYS * DAY) - START) / DAY, 0.25))
+    for name in ["item_prev_shown", "item_prev_clicks", "user_prev_shown", "user_prev_clicks",
+                 "ui_prev_shown", "item_users_before", "user_clicks_before"]:
+        F[f"{name}_per_day"] = (F[name] / elapsed).astype(np.float32)
 
     # ---- The choice model ------------------------------------------------------
     choice_model_features(D, F, day)
@@ -541,7 +626,8 @@ def build_features(D):
     for name in ["item_ctr", "item_prevday_ctr", "ui_ctr", "svd_score", "svd_hist_mean_cos",
                  "svd_hist_max_cos", "cand_in_hist", "item_users_before", "item_tb_ctr",
                  "item_dt_ctr", "trans_last1", "trans_last3", "mf_logit", "mf_dot",
-                 "item_day_share", "svd_same_bucket_cos"]:
+                 "item_day_share", "svd_same_bucket_cos", "cf_sum", "cf_max", "cf_recent5",
+                 "seq3_last5", "item_users_before_per_day"]:
         a = np.nan_to_num(F[name], nan=-1)
         F[f"{name}_rank"] = (a.argsort(1).argsort(1) / (CAND - 1)).astype(np.float32)
         F[f"{name}_minus_max"] = (a - a.max(1, keepdims=True)).astype(np.float32)
@@ -626,13 +712,14 @@ def rebalance(p, beta):
 def validate(X, meta, cols, args):
     y, day = meta["y"], meta["day"]
     names = [meta["names"][c] for c in cols]
-    fit = pick_rows((day < N_TRAIN_DAYS - 1) & ~meta["is_eval"], y, args.neg_frac, 0)
+    fit = pick_rows((day < N_TRAIN_DAYS - 1) & (day >= args.min_day) & ~meta["is_eval"], y, args.neg_frac, 0)
     val_all = np.nonzero(day == N_TRAIN_DAYS - 1)[0]
     first = meta["first"][val_all]
     val = val_all[first]
-    log(f"Validation: fit {len(fit):,} rows (days 0-5), test {len(val):,} rows "
+    log(f"Validation: fit {len(fit):,} rows (days {args.min_day}-5), test {len(val):,} rows "
         f"(first event per user, day 6)")
-    for name in ["mf_prob", "svd_hist_mean_cos", "item_ctr"]:
+    for name in ["mf_prob", "svd_hist_mean_cos", "svd_score", "cf_sum", "cf_max", "seq3_last5",
+                 "trans_last3", "cand_in_hist", "user_ctr", "item_ctr"]:
         log(f"  single feature {name:<18} AUC {roc_auc_score(y[val] == 1, np.nan_to_num(X[val, meta['names'].index(name)], nan=-9)):.5f}")
     dtrain = lgb.Dataset(take(X, fit, cols), y[fit], feature_name=names, free_raw_data=True)
     Xv = take(X, val_all, cols)
@@ -659,6 +746,50 @@ def validate(X, meta, cols, args):
     return best_auc, model.best_iteration, best_beta, model
 
 
+ABLATION_GROUPS = {
+    "choice model (mf_)": lambda n: n.startswith("mf_"),
+    "SVD taste (svd_)": lambda n: n.startswith("svd_"),
+    "exact co-clicks (cf_)": lambda n: n.startswith("cf_"),
+    "sequence links (trans_, seq3_)": lambda n: n.startswith(("trans_", "seq3_")),
+    "repeat clicks (cand_)": lambda n: n.startswith("cand_"),
+    "time of day / weekend": lambda n: any(t in n for t in ("_tb", "_dt", "bucket", "daytype", "hour",
+                                                             "day_of_week", "day_type")),
+    "per-day rates": lambda n: n.endswith("_per_day"),
+    "event comparisons": lambda n: n.endswith(("_rank", "_minus_max", "_minus_mean")),
+}
+
+
+def ablate(X, meta, cols, args):
+    """Quick models without one feature group at a time: which groups actually help?"""
+    y, day = meta["y"], meta["day"]
+    val_all = np.nonzero(day == N_TRAIN_DAYS - 1)[0]
+    val = val_all[meta["first"][val_all]]
+    quick = {**PARAMS, "learning_rate": 0.1, "metric": "auc", "seed": 0}
+
+    def score(use_cols, min_day=0):
+        fit = pick_rows((day < N_TRAIN_DAYS - 1) & (day >= min_day) & ~meta["is_eval"], y, 0.3, 0)
+        dtr = lgb.Dataset(take(X, fit, use_cols), y[fit], free_raw_data=True)
+        dv = lgb.Dataset(take(X, val, use_cols), y[val], reference=dtr)
+        m = lgb.train(quick, dtr, num_boost_round=1500, valid_sets=[dv],
+                      callbacks=[lgb.early_stopping(50, verbose=False)])
+        return m.best_score["valid_0"]["auc"]
+
+    log("Ablation (quick models, lr 0.1): local AUC without each group")
+    base = score(cols)
+    log(f"  all features            {base:.5f}")
+    names = meta["names"]
+    for g, test in ABLATION_GROUPS.items():
+        keep = [c for c in cols if not test(names[c])]
+        if len(keep) == len(cols):
+            continue
+        a = score(keep)
+        verdict = "HELPS" if base - a > 0.0005 else ("HURTS - try --drop" if a - base > 0.0005 else "neutral")
+        log(f"  without {g:<32} {a:.5f}  ({a - base:+.5f})  {len(cols) - len(keep)} features, {verdict}")
+    for md in [2]:
+        a = score(cols, md)
+        log(f"  train on days {md}-5 only{'':<17} {a:.5f}  ({a - base:+.5f})")
+
+
 def final_submission(X, meta, cols, args, n_trees, beta, val_model):
     y = meta["y"]
     names = [meta["names"][c] for c in cols]
@@ -669,8 +800,8 @@ def final_submission(X, meta, cols, args, n_trees, beta, val_model):
         log("Using the validation model for the submission (--no-refit)")
         preds = val_model.predict(Xe, num_iteration=val_model.best_iteration)
     else:
-        fit = pick_rows(~meta["is_eval"], y, args.neg_frac, 1)
-        log(f"Final model: {len(fit):,} rows (days 0-6), {n_trees} trees x {args.seeds} seed(s)")
+        fit = pick_rows(~meta["is_eval"] & (meta["day"] >= args.min_day), y, args.neg_frac, 1)
+        log(f"Final model: {len(fit):,} rows (days {args.min_day}-6), {n_trees} trees x {args.seeds} seed(s)")
         dtrain = lgb.Dataset(take(X, fit, cols), y[fit], feature_name=names, free_raw_data=False)
         for seed in range(args.seeds):
             model = lgb.train({**PARAMS, "seed": seed}, dtrain, num_boost_round=n_trees)
@@ -723,6 +854,9 @@ def main():
     ap.add_argument("--use-slot", action="store_true")
     ap.add_argument("--refit-last", action="store_true",
                     help="skip validation: retrain on ALL days with the trees/beta/lr found by the last validated run")
+    ap.add_argument("--ablate", action="store_true", help="test which feature groups help (adds a few minutes)")
+    ap.add_argument("--drop", default="", help="comma-separated feature name prefixes to leave out, e.g. cf_,seq3_")
+    ap.add_argument("--min-day", type=int, default=0, help="train only on days >= this")
     ap.add_argument("--note", default="")
     args = ap.parse_args()
     if args.fast:
@@ -751,7 +885,13 @@ def main():
 
     use_slot = args.use_slot or meta["slot_ok"]
     cols = list(range(len(meta["names"]) - (0 if use_slot else 1)))   # slot is the last column
-    log(f"Using {len(cols)} features (slot {'on' if use_slot else 'off'})")
+    drop = tuple(p for p in args.drop.split(",") if p)
+    if drop:
+        cols = [c for c in cols if not meta["names"][c].startswith(drop)]
+    log(f"Using {len(cols)} features (slot {'on' if use_slot else 'off'}"
+        f"{', dropped ' + args.drop if drop else ''})")
+    if args.ablate:
+        ablate(X, meta, cols, args)
 
     auc, n_trees, beta, val_model = None, args.trees, args.beta, None
     if not args.skip_valid:
