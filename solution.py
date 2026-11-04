@@ -43,14 +43,14 @@ import numpy as np
 import pandas as pd
 from scipy import sparse
 from sklearn.metrics import roc_auc_score
-from sklearn.utils.extmath import randomized_svd
+from scipy.sparse.linalg import svds
 
 DAY = 86400
 START = 1737331200          # 2025-01-20 00:00 UTC, first training day
 N_TRAIN_DAYS = 7            # training ends at the cutoff, 2025-01-27 00:00 UTC
 CAND = 10                   # candidates per event
-SVD_DIM = 48
-FEATURE_VERSION = "v5"
+SVD_DIM = 12                # the taste space is small: 12 beat 48 by a lot on the real data
+FEATURE_VERSION = "v6"
 T0 = time.time()
 
 
@@ -217,11 +217,16 @@ def svd_for_day(clicks, cutoff, n_users, n_items):
     X.data = np.log1p(X.data)
     item_users = np.asarray((X > 0).sum(0)).ravel()
     user_clicks = np.asarray(X.sum(1)).ravel()
-    idf = np.log((1 + (user_clicks > 0).sum()) / (1 + item_users)).astype(np.float32)
-    X = X @ sparse.diags(idf)
-    norms = np.sqrt(np.asarray(X.multiply(X).sum(1)).ravel())
-    X = sparse.diags(1 / np.maximum(norms, 1e-9)) @ X
-    U, S, VT = randomized_svd(X, SVD_DIM, n_iter=5, random_state=0)
+    # Weight every click by (n_u + 20)^-0.5 * (n_i + 20)^-0.5 (n_u = items the user clicked,
+    # n_i = users who clicked the item), so very active users and very popular items don't dominate.
+    n_u = np.asarray((X > 0).sum(1)).ravel()
+    X = (sparse.diags((n_u + 20.0) ** -0.5) @ X @ sparse.diags((item_users + 20.0) ** -0.5)).astype(np.float64)
+    try:                                                      # exact SVD (ARPACK), not randomized
+        U, S, VT = svds(X, k=SVD_DIM, random_state=0)
+    except TypeError:                                         # older scipy without random_state
+        U, S, VT = svds(X, k=SVD_DIM)
+    order = np.argsort(-S)
+    U, S, VT = U[:, order], S[order], VT[order]
     user_vec = (U * S).astype(np.float32)
     item_vec = VT.T.astype(np.float32)
     item_norm = item_vec / np.maximum(np.linalg.norm(item_vec, axis=1, keepdims=True), 1e-9)
@@ -643,7 +648,8 @@ def build_features(D):
         F[f"ev_max_{name}"] = ev(np.where(cnt > 0, mx, np.nan))
         F[f"ev_mean_{name}"] = ev(np.where(cnt > 0, mean, np.nan))
         top2 = np.sort(np.where(nan, -np.inf, a), 1)[:, -2]
-        F[f"ev_gap12_{name}"] = ev(np.where(cnt > 1, mx - top2, np.nan))   # how clear the favourite is
+        with np.errstate(invalid="ignore"):
+            F[f"ev_gap12_{name}"] = ev(np.where(cnt > 1, mx - top2, np.nan))   # how clear the favourite is
     F["event_max_cand_in_hist"] = ev(F["cand_in_hist"].max(1))
 
     # ---- Slot: the candidate's position inside its event in the file -----------
